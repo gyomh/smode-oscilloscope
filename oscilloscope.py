@@ -46,13 +46,14 @@
 #                                              |    l'ecran)                              |
 #                                              |                                          |
 #                                              | GOTCHAS IMPORTANTS :                     |
-#                                              | - ShapeTextureMask.shape.placement.      |
-#                                              |   scale.size (masques circulaires) se    |
-#                                              |   fait RECALCULER (reset ~500px/reso)    |
-#                                              |   une fois le document installe dans la  |
-#                                              |   scene -> TOUJOURS reappliquer ces      |
-#                                              |   valeurs APRES l'insertion finale (voir |
-#                                              |   bloc "POST-INSERTION FIXES" en bas).   |
+#                                              | - Toute forme cercle neuve (point,       |
+#                                              |   masques circulaires) repasse a 500 px  |
+#                                              |   1-2 images APRES la fin du script ->   |
+#                                              |   le Trace Writer reecrit les tailles    |
+#                                              |   pendant ses 30 premieres images.       |
+#                                              | - Audio : bande en Hz, niveaux en dB     |
+#                                              |   (pas en %) ; chaque borne est limitee  |
+#                                              |   par l'autre (debut, fin, puis debut).  |
 #                                              | - Size2d/ScaleFactor ont un flag         |
 #                                              |   `.linked` (True par defaut) qui force  |
 #                                              |   width=height des qu'on en modifie un   |
@@ -79,12 +80,23 @@ nPoints: Oil.PositiveInteger(1920)          # nombre de points de la ligne de tr
 sweepPeriod: Oil.PositiveReal(4.0)          # secondes pour balayer l'ecran une fois
 nEchoes: Oil.PositiveInteger(10)            # nombre d'echos FrameDelay pour combler les trous a haute vitesse
 oscLabel: Oil.String("Oscilloscope")        # nom du calque cree dans la scene
+freqMinHz: Oil.PositiveReal(40.0)           # bas de la bande audio suivie (Hz)
+freqMaxHz: Oil.PositiveReal(250.0)          # haut de la bande audio suivie (Hz)
+levelMinDb: Oil.Real(-50.0)                 # niveau (dB) qui met le point en bas
+levelMaxDb: Oil.Real(0.0)                   # niveau (dB) qui met le point en haut
+pointSize: Oil.PositiveReal(20.0)           # diametre du point lumineux (px)
 # ==========================================================================================
 
 N_POINTS = script.nPoints.get()
 SWEEP_PERIOD = script.sweepPeriod.get()
 N_ECHOES = script.nEchoes.get()
 OSC_LABEL = script.oscLabel.get()
+# The spectrum extractor works in Hz and dB (not in percentages).
+FREQ_MIN = max(22.05, script.freqMinHz.get())
+FREQ_MAX = max(FREQ_MIN + 1.0, script.freqMaxHz.get())
+LEVEL_MIN = min(script.levelMinDb.get(), script.levelMaxDb.get() - 1.0)
+LEVEL_MAX = min(0.0, script.levelMaxDb.get())
+POINT_PX = max(2.0, script.pointSize.get())
 
 WRAP_MODE_REPEAT = 1
 BLENDING_MODE_LINEAR_DODGE = 12
@@ -126,13 +138,13 @@ pointShape = Oil.createObject("ShapeLayer")
 pointShape.label = "Oscilloscope Point"
 circleGen = Oil.createObject("CircleShapeGenerator")
 pointShape.generator = circleGen
-pointShape.renderer.fill.enabled = False
-pointShape.renderer.stroke.enabled = True
-pointShape.renderer.stroke.thickness.set(10.0)
-pointShape.renderer.stroke.color.red.set(0.02848031371831894)
-pointShape.renderer.stroke.color.green.set(0.976307213306427)
-pointShape.renderer.stroke.color.blue.set(0.0)
-pointShape.renderer.stroke.color.alpha.set(1.0)
+# A small bright dot (SMODE gives a new circle 500 px: its size is written again by the Trace Writer).
+pointShape.renderer.fill.enabled = True
+pointShape.renderer.fill.color.red.set(0.02848031371831894)
+pointShape.renderer.fill.color.green.set(0.976307213306427)
+pointShape.renderer.fill.color.blue.set(0.0)
+pointShape.renderer.fill.color.alpha.set(1.0)
+pointShape.renderer.stroke.enabled = False
 pointShape.renderer.placement.position.x = 0.5
 pointShape.renderer.placement.position.y = 0.5
 
@@ -158,6 +170,46 @@ traceurCompo.layers.append(pointShape)
 writerSourceCode = '''
 lastIdx: Oil.Integer(-1)
 lastY: Oil.Real(0.5)
+sizeFrames: Oil.Integer(0)   # internal: frames since the sizes were written
+
+# SMODE puts every new circle back to 500 px a frame or two after it is installed: during its first frames, this
+# script writes the sizes again (point, the two circle masks of Trace, the circle mask of the grid).
+SIZE_FIX_FRAMES = 30
+if script.sizeFrames.get() < SIZE_FIX_FRAMES:
+    script.sizeFrames.set(script.sizeFrames.get() + 1)
+
+    def setSize(gen, w, h):
+        if gen is None:
+            return
+        size = gen.placement.scale.size
+        size.linked.set(False)
+        size.width.set(w)
+        size.height.set(h)
+
+    def firstCircle(modifier):
+        for mk in modifier.masks:
+            if mk.getOilClassName() == "ShapeTextureMask" and mk.shape is not None:
+                return mk.shape
+        return None
+
+    traceurCompo = script.parentElement
+    for l in traceurCompo.layers:
+        if l.getFriendlyName() == "Oscilloscope Point":
+            setSize(l.generator, POINT_W, POINT_H)
+    traceCompo = traceurCompo.parentElement.parentElement      # Traceur layer -> Trace compo
+    for m in traceCompo.modifiers:
+        if m.getFriendlyName() == "2D Transform":
+            setSize(firstCircle(m), 1.0385, 1.463)
+        elif m.getFriendlyName() == "Mask":
+            setSize(firstCircle(m), 0.9, 2.0)
+    mainCompo = traceCompo.parentElement.parentElement          # Trace layer -> Oscilloscope compo
+    for l in mainCompo.layers:
+        if l.getFriendlyName() == "Screen":
+            for g in l.generator.layers:
+                if g.generator is not None and g.generator.getOilClassName() == "TestPatternTextureGenerator":
+                    for m in g.generator.modifiers:
+                        if m.getFriendlyName() == "2D Transform":
+                            setSize(firstCircle(m), 1.0385, 1.463)
 
 movingShape = None
 lineShape = None
@@ -165,8 +217,10 @@ for l in script.parentElement.layers:
     if l.getOilClassName() == "ShapeLayer":
         if l.getFriendlyName() == "Trace Line":
             lineShape = l
-        else:
+        elif l.getFriendlyName() == "Oscilloscope Point":
             movingShape = l
+if movingShape is None or lineShape is None:
+    raise RuntimeError("Trace Line or Oscilloscope Point missing in Traceur: run the Oscilloscope script again")
 
 px = movingShape.renderer.placement.position.x.get()
 py = movingShape.renderer.placement.position.y.get()
@@ -191,6 +245,7 @@ else:
 script.lastIdx.set(idx)
 script.lastY.set(py)
 '''
+writerSourceCode = writerSourceCode.replace("POINT_W", repr(POINT_PX / 1920.0)).replace("POINT_H", repr(POINT_PX / 1080.0))
 writerScript = Oil.createObject("PythonScriptTool")
 writerScript.label = "Trace Writer"
 writerScript.script.sourceCode.set(writerSourceCode)
@@ -233,12 +288,15 @@ traceurLayer.renderer.placement.position.y = 0.584
 traceCompo = Oil.createObject("Compo")
 traceCompo.layers.append(traceurLayer)
 
-dsDevice = None
-for d in engine.devices.devices:
-    if d.getOilClassName() == "JuceAudioDevice" and "DirectSound" in str(d.identifier):
-        dsDevice = d
-        break
-audioChannel = None
+# Audio input: the first audio device with input channels (a DirectSound one first), its "Left" channel
+# (else its first one).
+audioDevices = [d for d in engine.devices.devices
+                if d.getOilClassName() == "JuceAudioDevice" and len(d.inputChannels) > 0]
+audioDevices.sort(key=lambda d: 0 if "DirectSound" in str(d.identifier) else 1)
+if not audioDevices:
+    raise RuntimeError("No audio input device in SMODE (Devices panel): add one, then run the script again")
+dsDevice = audioDevices[0]
+audioChannel = dsDevice.inputChannels[0]
 for ch in dsDevice.inputChannels:
     if ch.getFriendlyName() == "Left":
         audioChannel = ch
@@ -246,10 +304,13 @@ for ch in dsDevice.inputChannels:
 
 ySource = Oil.createObject("AudioSpectrumLinkSource")
 ySource.extractor.audioChannel.set(audioChannel)
-ySource.extractor.frequencyInterval.begin.set(0.048575036114206355)
-ySource.extractor.frequencyInterval.end.set(0.10531644660245232)
-ySource.extractor.amplitudeInterval.begin.set(0.0)
-ySource.extractor.amplitudeInterval.end.set(0.32816902088447353)
+# Each bound is clamped by the other one: begin, end, then begin again works for any band.
+ySource.extractor.frequencyInterval.begin.set(FREQ_MIN)
+ySource.extractor.frequencyInterval.end.set(FREQ_MAX)
+ySource.extractor.frequencyInterval.begin.set(FREQ_MIN)
+ySource.extractor.amplitudeInterval.begin.set(LEVEL_MIN)
+ySource.extractor.amplitudeInterval.end.set(LEVEL_MAX)
+ySource.extractor.amplitudeInterval.begin.set(LEVEL_MIN)
 
 ySmooth = Oil.createObject("SmoothLinkModifier")
 ySmooth.positiveSpeed.set(20.0)
@@ -553,37 +614,22 @@ mainCompo.layers.append(screenMasqueLayer)
 paramBank = Oil.createObject("ParameterBank")
 paramBank.label = "Parameters"
 
-freqMinParam = Oil.createObject("Parameter(Percentage)")
-freqMinParam.label = "Frequency Interval Min"
-freqMinParam.value.set(0.048575036114206355)
-t = Oil.createObject("ParameterLinkTarget")
-t.target.set(ySource.extractor.frequencyInterval.begin)
-freqMinParam.targets.append(t)
-paramBank.parameters.append(freqMinParam)
+# Band and levels exposed with the extractor's own units (Hz, dB): a Percentage parameter linked to them
+# sends nonsense (band stuck at 22 Hz, range 0 dB -> 0 dB: the point never moves).
+def addAudioParam(cls, label, value, target):
+    p = Oil.createObject("Parameter(%s)" % cls)
+    p.label = label
+    p.value.set(value)
+    t = Oil.createObject("ParameterLinkTarget")
+    t.target.set(target)
+    p.targets.append(t)
+    paramBank.parameters.append(p)
+    return p
 
-freqMaxParam = Oil.createObject("Parameter(Percentage)")
-freqMaxParam.label = "Frequency Interval Max"
-freqMaxParam.value.set(0.10531644660245232)
-t = Oil.createObject("ParameterLinkTarget")
-t.target.set(ySource.extractor.frequencyInterval.end)
-freqMaxParam.targets.append(t)
-paramBank.parameters.append(freqMaxParam)
-
-ampMinParam = Oil.createObject("Parameter(Percentage)")
-ampMinParam.label = "Amplitude Interval Min"
-ampMinParam.value.set(0.0)
-t = Oil.createObject("ParameterLinkTarget")
-t.target.set(ySource.extractor.amplitudeInterval.begin)
-ampMinParam.targets.append(t)
-paramBank.parameters.append(ampMinParam)
-
-ampMaxParam = Oil.createObject("Parameter(Percentage)")
-ampMaxParam.label = "Amplitude Interval Max"
-ampMaxParam.value.set(0.32816902088447353)
-t = Oil.createObject("ParameterLinkTarget")
-t.target.set(ySource.extractor.amplitudeInterval.end)
-ampMaxParam.targets.append(t)
-paramBank.parameters.append(ampMaxParam)
+freqMinParam = addAudioParam("Frequency", "Frequency Interval Min", FREQ_MIN, ySource.extractor.frequencyInterval.begin)
+freqMaxParam = addAudioParam("Frequency", "Frequency Interval Max", FREQ_MAX, ySource.extractor.frequencyInterval.end)
+ampMinParam = addAudioParam("Decibel", "Amplitude Interval Min", LEVEL_MIN, ySource.extractor.amplitudeInterval.begin)
+ampMaxParam = addAudioParam("Decibel", "Amplitude Interval Max", LEVEL_MAX, ySource.extractor.amplitudeInterval.end)
 
 # Position Y de Trace, exposee pour reglage manuel
 traceYParam = Oil.createObject("Parameter(Percentage)")
@@ -693,21 +739,8 @@ oscLayer.label = OSC_LABEL
 oscLayer.renderer.placement.verticalFlip = False
 script.parentElement.layers.append(oscLayer)
 
-# ============================================================================
-# POST-INSERTION FIXES : le scale des masques circulaires (ShapeTextureMask.shape.
-# placement.scale.size) se fait recalculer une fois installe dans le document live
-# (reset ~500px/resolution). On reapplique donc les valeurs ICI, apres l'insertion.
-# ============================================================================
-transformCircleGen.placement.scale.size.linked.set(False)
-transformCircleGen.placement.scale.size.width.set(1.0385)
-transformCircleGen.placement.scale.size.height.set(1.463)
+# The circle sizes (point, circle masks) are put back to 500 px by SMODE one or two frames AFTER this script ends:
+# setting them here is not enough, the Trace Writer writes them again during its first frames.
 
-gridTransformCircleGen.placement.scale.size.linked.set(False)
-gridTransformCircleGen.placement.scale.size.width.set(1.0385)
-gridTransformCircleGen.placement.scale.size.height.set(1.463)
-
-crtCircleGen.placement.scale.size.linked.set(False)
-crtCircleGen.placement.scale.size.width.set(0.9)
-crtCircleGen.placement.scale.size.height.set(2.0)
-
-result = f"{OSC_LABEL} recree : {N_POINTS} points, {N_ECHOES} echos, masques compenses"
+result = (f"{OSC_LABEL} recree : {N_POINTS} points, {N_ECHOES} echos, audio {FREQ_MIN:.0f}-{FREQ_MAX:.0f} Hz "
+          f"({LEVEL_MIN:.0f} a {LEVEL_MAX:.0f} dB) sur {dsDevice.getFriendlyName()} / {audioChannel.getFriendlyName()}")
